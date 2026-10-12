@@ -231,6 +231,7 @@ import type {
   taskWatchdogService,
 } from "../services/task-watchdogs.js";
 import { logger } from "../middleware/logger.js";
+import { waitForConversationOwnershipRelease } from "../services/conversation-continuation.js";
 import {
   badRequest,
   conflict,
@@ -15737,6 +15738,29 @@ export function issueRoutes(
           }
         }
 
+        if (interruptedRunId && wakeups.size > 0) {
+          // The run this update cancelled still owns execution until its
+          // process exits and its lease is released; a wake dispatched before
+          // that is skipped for good.
+          const released = await waitForConversationOwnershipRelease(db, {
+            companyId: issue.companyId,
+            issueId: issue.id,
+            runId: interruptedRunId,
+          }).catch((err) => {
+            logger.warn(
+              { err, issueId: issue.id, runId: interruptedRunId },
+              "failed to wait for the interrupted run to release execution",
+            );
+            return false;
+          });
+          if (!released) {
+            logger.warn(
+              { issueId: issue.id, runId: interruptedRunId },
+              "interrupted run still owns execution; dispatching issue wakes anyway",
+            );
+          }
+        }
+
         for (const { agentId, wakeup } of wakeups.values()) {
           heartbeat
             .wakeup(agentId, wakeup)
@@ -19109,6 +19133,29 @@ export function issueRoutes(
                 childIssueSummaryTruncated: parent.childIssueSummaryTruncated,
               },
             });
+          }
+        }
+
+        if (interruptedRunId && wakeups.size > 0) {
+          // The run this update cancelled still owns execution until its
+          // process exits and its lease is released; a wake dispatched before
+          // that is skipped for good.
+          const released = await waitForConversationOwnershipRelease(db, {
+            companyId: currentIssue.companyId,
+            issueId: currentIssue.id,
+            runId: interruptedRunId,
+          }).catch((err) => {
+            logger.warn(
+              { err, issueId: currentIssue.id, runId: interruptedRunId },
+              "failed to wait for the interrupted run to release execution",
+            );
+            return false;
+          });
+          if (!released) {
+            logger.warn(
+              { issueId: currentIssue.id, runId: interruptedRunId },
+              "interrupted run still owns execution; dispatching issue wakes anyway",
+            );
           }
         }
 

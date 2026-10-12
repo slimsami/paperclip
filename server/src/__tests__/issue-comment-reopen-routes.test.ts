@@ -157,6 +157,15 @@ vi.mock("../services/issues.js", () => ({
   issueService: () => mockIssueService,
 }));
 
+const mockWaitForConversationOwnershipRelease = vi.hoisted(() =>
+  vi.fn(async (_db: unknown, _input: unknown) => true),
+);
+
+vi.mock("../services/conversation-continuation.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../services/conversation-continuation.js")>()),
+  waitForConversationOwnershipRelease: mockWaitForConversationOwnershipRelease,
+}));
+
 vi.mock("../services/routines.js", () => ({
   routineService: () => mockRoutineService,
 }));
@@ -389,6 +398,8 @@ describe("issue comment reopen routes", () => {
     mockHeartbeatService.getRun.mockResolvedValue(null);
     mockHeartbeatService.getActiveRunForAgent.mockResolvedValue(null);
     mockHeartbeatService.cancelRun.mockResolvedValue(null);
+    mockWaitForConversationOwnershipRelease.mockReset();
+    mockWaitForConversationOwnershipRelease.mockResolvedValue(true);
     mockExternalObjectService.syncCommentSafely.mockResolvedValue(undefined);
     mockExternalObjectService.syncIssueSafely.mockResolvedValue(undefined);
     mockObserveCrossIssueInfluence.mockResolvedValue({
@@ -4106,5 +4117,109 @@ describe("issue comment reopen routes", () => {
         }),
       ),
     );
+  });
+
+  it("wakes the new assignee only after the run cancelled by a reassignment released execution", async () => {
+    // The author's own run hands the issue over: the route cancels that run,
+    // whose environment lease is released a moment later. A wake dispatched
+    // before then is skipped as execution_reconciliation_required for good.
+    const issue = makeIssue("in_progress");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(
+      async (_id: string, patch: Record<string, unknown>) =>
+        makeIssueUpdateReceipt(issue, patch),
+    );
+    mockHeartbeatService.getActiveRunForAgent.mockResolvedValue({
+      id: "run-1",
+      status: "running",
+      contextSnapshot: { issueId: issue.id },
+    } as never);
+    mockHeartbeatService.cancelRun.mockResolvedValue({
+      id: "run-1",
+      status: "cancelled",
+      companyId: "company-1",
+    } as never);
+    let release!: (released: boolean) => void;
+    mockWaitForConversationOwnershipRelease.mockImplementation(
+      () => new Promise<boolean>((resolve) => { release = resolve; }),
+    );
+
+    const res = await request(await installActor(createApp()))
+      .patch(`/api/issues/${issue.id}`)
+      .send({ assigneeAgentId: "33333333-3333-4333-8333-333333333333" });
+
+    expect(res.status).toBe(200);
+    await vi.waitFor(() =>
+      expect(mockWaitForConversationOwnershipRelease).toHaveBeenCalledWith(
+        expect.anything(),
+        { companyId: "company-1", issueId: issue.id, runId: "run-1" },
+      ),
+    );
+    expect(mockHeartbeatService.wakeup).not.toHaveBeenCalled();
+
+    release(true);
+    await waitForWakeup(() =>
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        "33333333-3333-4333-8333-333333333333",
+        expect.objectContaining({
+          reason: "issue_assigned",
+          payload: expect.objectContaining({ interruptedRunId: "run-1" }),
+        }),
+      ),
+    );
+  });
+
+  it("still wakes the new assignee when the cancelled run never releases execution", async () => {
+    const issue = makeIssue("in_progress");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(
+      async (_id: string, patch: Record<string, unknown>) =>
+        makeIssueUpdateReceipt(issue, patch),
+    );
+    mockHeartbeatService.getActiveRunForAgent.mockResolvedValue({
+      id: "run-1",
+      status: "running",
+      contextSnapshot: { issueId: issue.id },
+    } as never);
+    mockHeartbeatService.cancelRun.mockResolvedValue({
+      id: "run-1",
+      status: "cancelled",
+      companyId: "company-1",
+    } as never);
+    mockWaitForConversationOwnershipRelease.mockResolvedValue(false);
+
+    const res = await request(await installActor(createApp()))
+      .patch(`/api/issues/${issue.id}`)
+      .send({ assigneeAgentId: "33333333-3333-4333-8333-333333333333" });
+
+    expect(res.status).toBe(200);
+    await waitForWakeup(() =>
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        "33333333-3333-4333-8333-333333333333",
+        expect.objectContaining({ reason: "issue_assigned" }),
+      ),
+    );
+  });
+
+  it("does not wait when a reassignment interrupted no run", async () => {
+    const issue = makeIssue("todo");
+    mockIssueService.getById.mockResolvedValue(issue);
+    mockIssueService.update.mockImplementation(
+      async (_id: string, patch: Record<string, unknown>) =>
+        makeIssueUpdateReceipt(issue, patch),
+    );
+
+    const res = await request(await installActor(createApp()))
+      .patch(`/api/issues/${issue.id}`)
+      .send({ assigneeAgentId: "33333333-3333-4333-8333-333333333333" });
+
+    expect(res.status).toBe(200);
+    await waitForWakeup(() =>
+      expect(mockHeartbeatService.wakeup).toHaveBeenCalledWith(
+        "33333333-3333-4333-8333-333333333333",
+        expect.objectContaining({ reason: "issue_assigned" }),
+      ),
+    );
+    expect(mockWaitForConversationOwnershipRelease).not.toHaveBeenCalled();
   });
 });

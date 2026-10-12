@@ -97,6 +97,29 @@ function processMayBeAlive(pid: number): boolean {
   }
 }
 
+/** A run cancelled by an issue update (reassignment, interrupt) keeps execution
+ * ownership until its process exits and its environment lease is released,
+ * which lands shortly after the update commits. Wakes dispatched by that update
+ * in the meantime would see the cancelled run as the active owner and be
+ * recorded as skipped, with nothing to replay them. Waits until `runId` no
+ * longer owns the issue's execution; false when it still does at the deadline.
+ */
+export async function waitForConversationOwnershipRelease(db: Db, input: {
+  companyId: string;
+  issueId: string;
+  runId: string;
+  timeoutMs?: number;
+  intervalMs?: number;
+}): Promise<boolean> {
+  const deadline = Date.now() + (input.timeoutMs ?? 30_000);
+  for (;;) {
+    const blocker = await getConversationOwnershipBlocker(db, input.companyId, input.issueId);
+    if (!blocker || blocker.runId !== input.runId) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, input.intervalMs ?? 250));
+  }
+}
+
 /** A terminal conversation row does not prove that its execution authority ended.
  * Other adapters keep their existing bootstrap and ownership protocols.
  */
